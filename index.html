@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Worktree Manager</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --fg:#e6e8ee; --muted:#8b93a7; --accent:#4f8cff; --danger:#e5484d; --ok:#30a46c; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --card:#fff; --line:#e1e4ea; --fg:#1b1f27; --muted:#6b7280; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:12px; padding:14px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:2; }
+  header h1 { font-size:16px; margin:0; }
+  header .muted { margin-left:auto; }
+  main { padding:16px 20px; max-width:1100px; margin:0 auto; }
+  .muted { color:var(--muted); font-size:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; margin-bottom:12px; }
+  .repo-head { display:flex; align-items:center; gap:10px; padding:10px 14px; cursor:pointer; }
+  .repo-head h2 { font-size:15px; margin:0; }
+  .repo-head .spacer { flex:1; }
+  .badge { font-size:11px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
+  .wt { display:grid; grid-template-columns: 1fr auto; gap:6px 12px; padding:10px 14px; border-top:1px solid var(--line); align-items:center; }
+  .wt .name { font-weight:600; }
+  .wt .path { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; color:var(--muted); word-break:break-all; }
+  .wt .missing { color:var(--danger); }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+  button { font:inherit; font-size:13px; padding:5px 10px; border-radius:7px; border:1px solid var(--line); background:transparent; color:var(--fg); cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--danger); }
+  button.danger:hover { border-color:var(--danger); }
+  button:disabled { opacity:.5; cursor:default; }
+  input[type=text] { font:inherit; padding:6px 8px; border-radius:7px; border:1px solid var(--line); background:var(--bg); color:var(--fg); width:100%; }
+  .row { display:flex; gap:8px; align-items:center; margin:8px 0; }
+  .row label { min-width:90px; color:var(--muted); font-size:12px; }
+  dialog { border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--fg); padding:18px; width:min(680px,92vw); }
+  dialog::backdrop { background:rgba(0,0,0,.5); }
+  dialog h3 { margin:0 0 10px; font-size:15px; }
+  .sessions { max-height:320px; overflow:auto; border:1px solid var(--line); border-radius:8px; margin:8px 0; }
+  .session { display:grid; grid-template-columns:auto 1fr auto; gap:10px; padding:7px 10px; border-bottom:1px solid var(--line); align-items:center; }
+  .session:last-child { border-bottom:0; }
+  .session .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .session .m { font-size:11px; color:var(--muted); white-space:nowrap; }
+  .dlg-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+  .checks { display:flex; flex-direction:column; gap:4px; margin-top:8px; }
+  .toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:var(--card); border:1px solid var(--line); padding:10px 14px; border-radius:9px; max-width:80vw; box-shadow:0 8px 30px rgba(0,0,0,.3); }
+  .toast.err { border-color:var(--danger); }
+  .toast.ok { border-color:var(--ok); }
+  .empty { padding:10px 14px; color:var(--muted); border-top:1px solid var(--line); }
+  .show-more { display:block; margin:6px auto 20px; }
+  .main-chip { font-size:11px; color:var(--muted); font-family:ui-monospace,Menlo,monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Worktree Manager</h1>
+  <span id="cfg" class="muted"></span>
+  <span class="muted"><input id="filter" type="text" placeholder="filter repos…" style="width:200px"></span>
+  <button id="refresh">Refresh</button>
+</header>
+<main id="repos"><p class="muted">Loading…</p></main>
+
+<dialog id="dlg-create">
+  <h3>New worktree in <span id="create-repo"></span></h3>
+  <div class="row"><label>Branch</label><input id="create-branch" type="text" placeholder="feat/trx-1234-short-name" autofocus></div>
+  <div class="row"><label>Base ref</label><input id="create-base" type="text" placeholder="origin/main"></div>
+  <div class="row"><label></label><label><input id="create-fetch" type="checkbox" checked> git fetch --prune first</label></div>
+  <p class="muted" id="create-hint"></p>
+  <div class="dlg-actions"><button id="create-cancel">Cancel</button><button class="primary" id="create-ok">Create</button></div>
+</dialog>
+
+<dialog id="dlg-delete">
+  <h3>Delete worktree</h3>
+  <div class="path" id="delete-path" style="font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted);word-break:break-all"></div>
+  <p class="muted" id="delete-sessions-hint"></p>
+  <div class="sessions" id="delete-sessions"></div>
+  <div class="row" style="gap:12px"><button id="sel-all">Select all</button><button id="sel-none">Select none</button></div>
+  <div class="checks">
+    <label><input id="delete-force" type="checkbox"> Force (discard uncommitted changes)</label>
+    <label><input id="delete-branch" type="checkbox"> Also delete the branch</label>
+    <label><input id="delete-remaining" type="checkbox"> Delete the worktree's remaining Claude sessions (unselected ones)</label>
+  </div>
+  <div class="dlg-actions"><button id="delete-cancel">Cancel</button><button class="primary danger" id="delete-ok">Migrate selected & delete</button></div>
+</dialog>
+
+<dialog id="dlg-sessions">
+  <h3>Claude sessions</h3>
+  <div class="path" id="sessions-path" style="font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted);word-break:break-all"></div>
+  <div class="sessions" id="sessions-list"></div>
+  <div class="dlg-actions"><button id="sessions-close">Close</button><button class="primary" id="sessions-migrate">Migrate selected to parent repo</button></div>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>
