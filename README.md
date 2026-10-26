@@ -24,7 +24,7 @@ All repos must live as direct subfolders of one folder, `~/Documents/Repos` by d
 ## Install
 
 ```sh
-git clone <this repo> ~/Documents/Repos/worktree-manager
+git clone https://github.com/lovemehta/worktree-manager.git ~/Documents/Repos/worktree-manager
 cd ~/Documents/Repos/worktree-manager
 ./install.sh
 ```
