@@ -8,6 +8,11 @@ let serverURL = URL(string: ProcessInfo.processInfo.environment["WM_URL"] ?? "ht
 let intellijApp = ProcessInfo.processInfo.environment["INTELLIJ_APP"] ?? "IntelliJ IDEA"   // app name passed to `open -a` when the server is down
 
 struct Worktree: Decodable { let path: String; let branch: String?; let head: String?; let detached: Bool; let exists: Bool?; let lastActivity: Double? }
+struct Snip: Decodable { let role: String; let before: String; let match: String; let after: String }
+struct ChatHit: Decodable { let sessionId: String; let cwd: String?; let openPath: String?; let label: String; let sub: String?; let exists: Bool; let branch: String?; let title: String; let mtime: Double; let hits: Int; let snippets: [Snip] }
+struct SearchResult: Decodable { let total: Int; let sessions: [ChatHit]; let truncated: Bool }
+func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
 struct Repo: Decodable { let name: String; let path: String; let branch: String?; let worktrees: [Worktree]?; let error: String?; let lastActivity: Double?; let mainLastActivity: Double? }
 
 func ago(_ ms: Double?) -> String? {
@@ -21,7 +26,7 @@ func ago(_ ms: Double?) -> String? {
 
 // MARK: - Spotlight-style switcher (⌘⇧Space)
 
-struct Entry { let title: String; let subtitle: String; let path: String?; let repo: Repo?; let haystack: String; let last: Double; var create: String? = nil; var url: URL? = nil }
+struct Entry { let title: String; let subtitle: String; let path: String?; let repo: Repo?; let haystack: String; let last: Double; var create: String? = nil; var url: URL? = nil; var resume: String? = nil; var search = false }
 
 final class KeyPanel: NSPanel { override var canBecomeKey: Bool { true } }
 
@@ -34,6 +39,11 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
     private var repos: [Repo] = []
     private var current: Repo?          // nil = repo list, non-nil = that repo's worktrees
     private var creating = false        // true = typing a branch name for a new worktree in `current`
+    private var searching = false       // true = chat search mode (type "?" in the repo list)
+    private var chatRows: [Entry] = []
+    private var chatStatus = ""
+    private var searchWork: DispatchWorkItem?
+    private var searchTask: URLSessionDataTask?
     private var busy = false
     private var rows: [Entry] = []
     private let onOpen: (String) -> Void
@@ -106,7 +116,7 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
             let f = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: f.midX - 320, y: f.midY + f.height * 0.12))
         }
-        current = nil; creating = false; busy = false; field.stringValue = ""; applyFilter()
+        current = nil; creating = false; searching = false; chatRows = []; chatStatus = ""; busy = false; field.stringValue = ""; applyFilter()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(field)
@@ -117,8 +127,10 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
 
     private func enter(_ repo: Repo) { current = repo; creating = false; field.stringValue = ""; applyFilter(); panel.makeFirstResponder(field) }
     private func enterCreate(prefill: String) { creating = true; field.stringValue = prefill; applyFilter(); panel.makeFirstResponder(field); field.currentEditor()?.selectedRange = NSRange(location: prefill.count, length: 0) }
+    private func enterSearch(prefill: String) { searching = true; current = nil; creating = false; chatRows = []; chatStatus = ""; field.stringValue = prefill; applyFilter(); panel.makeFirstResponder(field); field.currentEditor()?.selectedRange = NSRange(location: prefill.count, length: 0) }
     private func back() {
-        if creating { creating = false } else { current = nil }
+        if searching { searching = false; chatRows = []; searchWork?.cancel(); searchTask?.cancel() }
+        else if creating { creating = false } else { current = nil }
         field.stringValue = ""; applyFilter(); panel.makeFirstResponder(field)
     }
 
@@ -145,8 +157,56 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         }.resume()
     }
 
+    // Debounced call to /api/search; results land in chatRows.
+    private func scheduleSearch() {
+        searchWork?.cancel(); searchTask?.cancel()
+        let q = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard q.count >= 2 else { chatRows = []; chatStatus = "Type at least 2 characters"; reloadRows(); return }
+        chatStatus = "Searching…"; reloadRows()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            var comps = URLComponents(url: serverURL.appendingPathComponent("api/search"), resolvingAgainstBaseURL: false)!
+            comps.queryItems = [URLQueryItem(name: "q", value: q)]
+            var req = URLRequest(url: comps.url!); req.timeoutInterval = 20
+            self.searchTask = URLSession.shared.dataTask(with: req) { data, resp, err in
+                DispatchQueue.main.async {
+                    guard self.searching, self.field.stringValue.trimmingCharacters(in: .whitespaces) == q else { return }
+                    guard let data = data, let res = try? JSONDecoder().decode(SearchResult.self, from: data) else {
+                        self.chatRows = []; self.chatStatus = "Error: " + (err?.localizedDescription ?? "HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"); self.reloadRows(); return
+                    }
+                    self.chatRows = res.sessions.map { h in
+                        let when = ago(h.mtime) ?? ""
+                        let snip = h.snippets.first.map { sn in
+                            let who = sn.role == "assistant" ? "Claude" : sn.role == "user" ? "You" : "Tool"
+                            return "\(who): " + (sn.before + sn.match + sn.after).replacingOccurrences(of: "\n", with: " ") } ?? ""
+                        let whereStr = [h.label + (h.sub.map { "/" + $0 } ?? ""), h.branch, when, h.exists ? nil : "folder gone"].compactMap { $0 }.joined(separator: " · ")
+                        let cmd = "cd " + shellQuote(h.cwd ?? h.openPath ?? "") + " && claude --resume " + h.sessionId
+                        return Entry(title: h.title, subtitle: whereStr + (snip.isEmpty ? "" : "  —  " + snip), path: h.exists ? h.openPath : nil, repo: nil, haystack: "", last: h.mtime, resume: cmd)
+                    }
+                    self.chatStatus = res.sessions.isEmpty ? "No chats contain “\(q)”" : "\(res.total) chat\(res.total == 1 ? "" : "s")" + (res.total > res.sessions.count ? ", newest \(res.sessions.count)" : "") + (res.truncated ? " · capped, narrow the search" : "")
+                    self.reloadRows()
+                }
+            }
+            self.searchTask?.resume()
+        }
+        searchWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+    private func reloadRows() {
+        rows = chatRows
+        hint.stringValue = chatStatus.isEmpty ? "↩ open in IntelliJ + copy resume command   ⌘↩ copy only   ⇥ back to repos   esc close" : chatStatus + "   ·   ↩ open + copy resume   ⌘↩ copy only   ⇥ back"
+        hint.textColor = chatStatus.hasPrefix("Error") ? .systemRed : .tertiaryLabelColor
+        table.reloadData()
+        if !rows.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false); table.scrollRowToVisible(0) }
+    }
+
     private func layoutHeader() {
-        if let r = current, creating {
+        if searching {
+            crumb.stringValue = "Chats ›"; crumb.sizeToFit()
+            crumb.frame.origin.y = 420 - 52; crumb.isHidden = false
+            field.frame = NSRect(x: 18 + crumb.frame.width + 8, y: 420 - 58, width: 640 - 36 - crumb.frame.width - 8, height: 40)
+            field.placeholderString = "search all Claude chats…"
+        } else if let r = current, creating {
             crumb.stringValue = r.name + " › new worktree ›"; crumb.sizeToFit()
             crumb.frame.origin.y = 420 - 52; crumb.isHidden = false
             field.frame = NSRect(x: 18 + crumb.frame.width + 8, y: 420 - 58, width: 640 - 36 - crumb.frame.width - 8, height: 40)
@@ -157,17 +217,19 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
             crumb.frame.origin.y = 420 - 52; crumb.isHidden = false
             field.frame = NSRect(x: 18 + crumb.frame.width + 8, y: 420 - 58, width: 640 - 36 - crumb.frame.width - 8, height: 40)
             field.placeholderString = "Worktree…"
-            hint.stringValue = "↩ open in IntelliJ   ⌫ / ← back   esc close"; hint.textColor = .tertiaryLabelColor
+            hint.stringValue = "↩ open in IntelliJ   ⌫ / ← back   ⇥ search chats   esc close"; hint.textColor = .tertiaryLabelColor
         } else {
             crumb.isHidden = true
             field.frame = NSRect(x: 18, y: 420 - 58, width: 640 - 36, height: 40)
             field.placeholderString = "Repo…"
-            hint.stringValue = "↩ / → worktrees   ⌘↩ open main   esc close"; hint.textColor = .tertiaryLabelColor
+            hint.stringValue = "↩ / → worktrees   ⌘↩ open main   ⇥ search chats   esc close"; hint.textColor = .tertiaryLabelColor
         }
     }
 
     private func applyFilter() {
+        if !searching, current == nil, field.stringValue.hasPrefix("?") { enterSearch(prefill: String(field.stringValue.dropFirst())); return }
         layoutHeader()
+        if searching { scheduleSearch(); return }
         let q = field.stringValue.lowercased().split(separator: " ").map(String.init)
         var out: [Entry] = []
         if let r = current, creating {
@@ -195,6 +257,8 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
             }
         }
         if current == nil {
+            out.append(Entry(title: "Search Claude chats…", subtitle: "find which repo or worktree you discussed something in · ⇥ or type ? first", path: nil, repo: nil,
+                             haystack: "search chats claude find", last: -2, search: true))
             out.append(Entry(title: "Open Worktree Manager", subtitle: "\(serverURL.absoluteString) · create, delete, migrate Claude chats", path: nil, repo: nil,
                              haystack: "open worktree manager web browser ui", last: -2, url: serverURL))
         }
@@ -210,8 +274,8 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         if let first = q.first { rows.sort { a, b in
             let pa = a.title.lowercased().hasPrefix(first), pb = b.title.lowercased().hasPrefix(first)
             return pa != pb ? pa : a.last > b.last } }
-        rows.sort { ($0.create == nil && $0.url == nil ? 0 : 1) < ($1.create == nil && $1.url == nil ? 0 : 1) }
-        if q.isEmpty && current == nil, rows.count > 41 { rows = Array(rows.prefix(40)) + [rows.last!] }
+        rows.sort { ($0.create == nil && $0.url == nil && !$0.search ? 0 : 1) < ($1.create == nil && $1.url == nil && !$1.search ? 0 : 1) }
+        if q.isEmpty && current == nil, rows.count > 42 { rows = Array(rows.prefix(40)) + rows.suffix(2) }
         table.reloadData()
         if !rows.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false); table.scrollRowToVisible(0) }
     }
@@ -220,6 +284,12 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         let row = table.selectedRow >= 0 ? table.selectedRow : 0
         guard row < rows.count else { return }
         let e = rows[row]
+        if e.search { enterSearch(prefill: ""); return }
+        if let cmd = e.resume {
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(cmd, forType: .string)
+            if openMain || e.path == nil { chatStatus = "Copied resume command" + (e.path == nil ? " (folder gone, migrate the chat first)" : ""); reloadRows(); return }
+            hide(); onOpen(e.path!); return
+        }
         if let u = e.url { hide(); NSWorkspace.shared.open(u); return }
         if let c = e.create { if creating { createWorktree(branch: c) } else { enterCreate(prefill: c) }; return }
         if let repo = e.repo { if openMain { hide(); onOpen(repo.path) } else { enter(repo) } }
@@ -239,16 +309,22 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         case #selector(NSResponder.moveDown(_:)): move(1); return true
         case #selector(NSResponder.moveUp(_:)): move(-1); return true
         case #selector(NSResponder.moveRight(_:)):
-            if current == nil, field.stringValue.isEmpty || textView.selectedRange.location >= field.stringValue.count { activateSelected(); return true }
+            if current == nil, !searching, field.stringValue.isEmpty || textView.selectedRange.location >= field.stringValue.count { activateSelected(); return true }
             return false
         case #selector(NSResponder.moveLeft(_:)):
-            if current != nil, field.stringValue.isEmpty { back(); return true }
+            if current != nil || searching, field.stringValue.isEmpty { back(); return true }
             return false
         case #selector(NSResponder.deleteBackward(_:)):
-            if current != nil, field.stringValue.isEmpty { back(); return true }
+            if current != nil || searching, field.stringValue.isEmpty { back(); return true }
             return false
         case #selector(NSResponder.insertNewline(_:)):
             if creating { createWorktree(branch: field.stringValue) } else { activateSelected(openMain: NSEvent.modifierFlags.contains(.command)) }
+            return true
+        case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
+            guard !creating else { return true }
+            let typed = field.stringValue
+            if searching { back(); field.stringValue = typed; applyFilter(); field.currentEditor()?.selectedRange = NSRange(location: typed.count, length: 0) }
+            else { enterSearch(prefill: typed) }
             return true
         case #selector(NSResponder.cancelOperation(_:)): hide(); return true
         default: return false

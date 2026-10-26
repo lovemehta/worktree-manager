@@ -99,6 +99,7 @@ The search box in the header searches every Claude Code transcript on this machi
 
 - The branch icon lists each repo as a submenu: "Open main" plus every worktree, with a "Recent" section of the last six picks. The list refreshes when the menu opens and every 60 s.
 - **⌘⇧Space** opens a palette: type to filter repos and worktrees (sorted by most recent Claude chat), ↑/↓ to move, Enter opens in IntelliJ, Esc closes. Also reachable from the menu ("Switcher") or with `pkill -USR1 -x WorktreeMenu`.
+- **Tab** in the palette switches to chat search (same search as the web UI, across every repo and worktree); the typed text carries over, Tab again goes back. `?` as the first character does the same. Enter copies `cd <folder> && claude --resume <id>` to the clipboard and opens the folder in IntelliJ; ⌘↩ only copies. Paste the command in a terminal to continue that chat.
 - If the server is down the menu shows "Start server" and still opens IntelliJ directly as a fallback.
 
 ## How chats are found
