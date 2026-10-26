@@ -166,6 +166,59 @@ async function showSessions(r, w, isMain) {
   });
 }
 
+// ----- global chat search (all repos + worktrees, including deleted ones) -----
+const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const CLAUDE_MARK = '<svg class="claude-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M13.6 3.2l1.2 5.6 5.6 1.2-5.6 1.2-1.2 5.6-1.2-5.6-5.6-1.2 5.6-1.2z"/><path fill="currentColor" d="M5.2 14.8l.7 2.8 2.8.7-2.8.7-.7 2.8-.7-2.8-2.8-.7 2.8-.7z"/></svg>';
+const roleLabel = (role) => role === 'assistant' ? `<span class="role claude">${CLAUDE_MARK}Claude</span>` : role === 'user' ? '<span class="role you">You</span>' : '<span class="role tool">Tool</span>';
+let searchTimer;
+async function runSearch() {
+  const q = $('#search').value.trim();
+  history.replaceState(null, '', q.length >= 2 ? `?q=${encodeURIComponent(q)}` : location.pathname);
+  const box = $('#search-results'), reposEl = $('#repos');
+  if (q.length < 2) { box.hidden = true; reposEl.hidden = false; box.innerHTML = ''; return; }
+  box.hidden = false; reposEl.hidden = true;
+  box.innerHTML = '<p class="muted">Searching…</p>';
+  let res;
+  try { res = await api(`/api/search?q=${encodeURIComponent(q)}&tools=${$('#search-tools').checked ? 1 : 0}`); }
+  catch (e) { box.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
+  if ($('#search').value.trim() !== q) return; // a newer search is already running
+  box.innerHTML = `<p class="muted">${res.total} chat${res.total === 1 ? '' : 's'} match “${esc(q)}”${res.total > res.sessions.length ? `, showing newest ${res.sessions.length}` : ''}${res.truncated ? ' · too many hits, results capped, narrow the search' : ''}</p>`;
+  for (const s of res.sessions) {
+    const card = document.createElement('section'); card.className = 'card hit';
+    card.innerHTML = `
+      <div class="repo-head">
+        <h2 title="${esc(s.cwd || '')}">${esc(s.label)}${s.sub ? `<span class="sub">/${esc(s.sub)}</span>` : ''}</h2>
+        ${s.branch ? `<span class="main-chip">${esc(s.branch)}</span>` : ''}
+        ${s.exists ? '' : '<span class="badge missing">folder gone</span>'}
+        <span class="badge">${s.hits} hit${s.hits === 1 ? '' : 's'}</span>
+        <span class="muted when" title="${esc(fmtDate(s.mtime))}">${ago(s.mtime)}</span>
+        <span class="spacer"></span>
+        <div class="actions">
+          <button data-act="copy" title="Copies: cd <folder> && claude --resume <id>">Copy resume command</button>
+          <button data-act="open" ${s.exists ? '' : 'disabled'}>Open in IntelliJ</button>
+        </div>
+      </div>
+      <div class="hit-title" title="${esc(s.title)}">${esc(s.title)}</div>
+      ${s.snippets.map(sn => `<div class="snip">${roleLabel(sn.role)}<span class="txt">${esc(sn.before)}<mark>${esc(sn.match)}</mark>${esc(sn.after)}</span></div>`).join('')}`;
+    card.addEventListener('click', (e) => {
+      const act = e.target.dataset.act; if (!act) return;
+      if (act === 'open') busy(e.target, () => api('/api/worktree/open', { path: s.openPath }));
+      if (act === 'copy') {
+        const cmd = `cd ${shellQuote(s.cwd)} && claude --resume ${s.sessionId}`;
+        const note = s.exists ? '' : ' (folder is gone: migrate this chat to the parent repo via Chats first)';
+        navigator.clipboard.writeText(cmd).then(() => toast('Copied: ' + cmd + note, 'ok'), () => toast(cmd + note));
+      }
+    });
+    box.appendChild(card);
+  }
+  if (!res.sessions.length) box.innerHTML += '<p class="muted">No chats contain that text.</p>';
+}
+$('#search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 300); };
+$('#search').onkeydown = (e) => { if (e.key === 'Escape') { $('#search').value = ''; runSearch(); } };
+$('#search-tools').onchange = runSearch;
+document.addEventListener('keydown', (e) => { if (e.key === '/' && !/^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName)) { e.preventDefault(); $('#search').focus(); $('#search').select(); } });
+{ const q0 = new URLSearchParams(location.search).get('q'); if (q0) { $('#search').value = q0; runSearch(); } }
+
 $('#refresh').onclick = () => load().catch(e => toast(e.message, 'err'));
 $('#filter').oninput = render;
 load().catch(e => toast(e.message, 'err'));

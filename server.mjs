@@ -7,7 +7,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import readline from 'node:readline';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
@@ -60,6 +61,77 @@ async function listWorktrees(repoPath) {
   return out;
 }
 
+// Read the ai-title and first real user prompt of a transcript, streaming and stopping early.
+async function sessionMeta(file) {
+  let title = null, firstPrompt = null, firstReply = null, firstCommand = null, cwd = null, branch = null;
+  try {
+    const rl = readline.createInterface({ input: fs.createReadStream(file, 'utf8'), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!title && line.includes('"type":"ai-title"')) { try { title = JSON.parse(line).aiTitle; } catch {} }
+      if (!firstPrompt && !firstReply && line.includes('"type":"assistant"')) {
+        try { const s = textsFromLine(JSON.parse(line), false).map(t => t.text).join(' ').trim(); if (s) firstReply = s.replace(/\s+/g, ' ').slice(0, 160); } catch {}
+      }
+      if ((!cwd && line.includes('"cwd":"')) || (!firstPrompt && line.includes('"type":"user"'))) {
+        try {
+          const j = JSON.parse(line);
+          if (!cwd && j.cwd) { cwd = j.cwd; branch = j.gitBranch || null; }
+          if (!firstPrompt && j.type === 'user') {
+            const s = textsFromLine(j, false).map(t => t.text).join(' ').trim();
+            if (s) firstPrompt = s.replace(/\s+/g, ' ').slice(0, 160);
+            else if (!firstCommand) { const raw = typeof j.message?.content === 'string' ? j.message.content : ''; const m = raw.match(/<command-name>([^<]+)<\/command-name>/); if (m) firstCommand = m[1].trim(); }
+          }
+        } catch {}
+      }
+      if (title && firstPrompt && cwd) { rl.close(); break; }
+    }
+  } catch {}
+  return { title, firstPrompt: firstPrompt || firstReply || firstCommand, cwd, branch };
+}
+
+// Shape shared by search results and the recent list.
+const inScope = (cwd, scope) => !scope || cwd === scope || (cwd || '').startsWith(scope + path.sep);
+async function describeSession(file, { cwd, branch, hits = 0, snippets = [], lastTs = 0, rootOf }) {
+  const [st, meta] = await Promise.all([fsp.stat(file).catch(() => null), sessionMeta(file)]);
+  cwd = cwd || meta.cwd; branch = branch || meta.branch;
+  const cwdExists = cwd ? await exists(cwd) : false;
+  const root = cwdExists ? await rootOf(cwd) : null;
+  const rel = (p) => p.startsWith(REPOS_DIR + path.sep) ? path.relative(REPOS_DIR, p) : p;
+  const label = cwd ? rel(root || cwd) : path.basename(path.dirname(file));
+  const sub = root && root !== cwd ? path.relative(root, cwd) : '';
+  return { sessionId: path.basename(file, '.jsonl'), cwd, openPath: root || cwd, label, sub, exists: cwdExists, branch, title: meta.title || meta.firstPrompt || '(no prompt)', mtime: st?.mtimeMs || lastTs, hits, snippets };
+}
+function makeRootResolver() {
+  const cache = new Map();
+  return (cwd) => { if (!cache.has(cwd)) cache.set(cwd, git(cwd, 'rev-parse', '--show-toplevel').then(r => r.stdout.trim(), () => null)); return cache.get(cwd); };
+}
+
+// Most recent chats across every project dir, optionally scoped to a folder (and its subfolders).
+async function recentSessions({ n = 10, scope = null } = {}) {
+  n = Math.min(Math.max(Number(n) || 10, 1), 200);
+  const dirs = (await fsp.readdir(CLAUDE_PROJECTS, { withFileTypes: true })).filter(d => d.isDirectory()).map(d => d.name);
+  const slug = scope ? slugFor(scope) : null;
+  const candidates = slug ? dirs.filter(d => d === slug || d.startsWith(slug + '-')) : dirs; // slug prefix is a superset of the scope; verified via cwd below
+  const files = [];
+  await Promise.all(candidates.map(async (d) => {
+    const pdir = path.join(CLAUDE_PROJECTS, d);
+    for (const name of await fsp.readdir(pdir).catch(() => [])) {
+      if (!name.endsWith('.jsonl')) continue;
+      const file = path.join(pdir, name);
+      const st = await fsp.stat(file).catch(() => null);
+      if (st) files.push({ file, mtime: st.mtimeMs });
+    }
+  }));
+  files.sort((a, b) => b.mtime - a.mtime);
+  const rootOf = makeRootResolver();
+  const out = [];
+  for (let i = 0; i < files.length && out.length < n; i += 20) {
+    const batch = await Promise.all(files.slice(i, i + 20).map(f => describeSession(f.file, { rootOf })));
+    for (const s of batch) { if (inScope(s.cwd, scope) && out.length < n) out.push(s); }
+  }
+  return { sessions: out, total: files.length };
+}
+
+
 async function sessionsFor(dirPath) {
   const pdir = projectDirFor(dirPath);
   if (!(await exists(pdir))) return [];
@@ -69,27 +141,110 @@ async function sessionsFor(dirPath) {
     if (!e.isFile() || !e.name.endsWith('.jsonl')) continue;
     const id = e.name.slice(0, -6);
     const full = path.join(pdir, e.name);
-    const st = await fsp.stat(full);
-    let title = null, firstPrompt = null;
-    try {
-      const text = await fsp.readFile(full, 'utf8');
-      for (const line of text.split('\n')) {
-        if (!title && line.includes('"type":"ai-title"')) { try { title = JSON.parse(line).aiTitle; } catch {} }
-        if (!firstPrompt && line.includes('"type":"user"')) {
-          try {
-            const j = JSON.parse(line);
-            const c = j.message?.content;
-            const s = typeof c === 'string' ? c : Array.isArray(c) ? c.filter(x => x.type === 'text').map(x => x.text).join(' ') : '';
-            if (s && !s.startsWith('<')) firstPrompt = s.slice(0, 160);
-          } catch {}
-        }
-        if (title && firstPrompt) break;
-      }
-    } catch {}
-    sessions.push({ id, title: title || firstPrompt || '(no prompt)', mtime: st.mtimeMs, size: st.size, hasDir: await exists(path.join(pdir, id)) });
+    const [st, meta] = await Promise.all([fsp.stat(full), sessionMeta(full)]);
+    sessions.push({ id, title: meta.title || meta.firstPrompt || '(no prompt)', mtime: st.mtimeMs, size: st.size, hasDir: await exists(path.join(pdir, id)) });
   }
   sessions.sort((a, b) => b.mtime - a.mtime);
   return sessions;
+}
+
+// ---------- global chat search ----------
+// Searches every transcript under ~/.claude/projects (all repos and worktrees, including deleted ones).
+// Case-insensitive literal substring match; uses ripgrep when installed, otherwise a Node line scan.
+const SEARCH_MAX_OUTPUT = 64 * 1024 * 1024; // bytes of rg output before we stop and report "truncated"
+const SEARCH_MAX_LINES_PER_FILE = 200;
+let rgAvailable = null;
+
+// Pull the human-readable text out of one transcript line. role: user | assistant | tool.
+function textsFromLine(j, includeTools) {
+  const out = [];
+  if ((j.type !== 'user' && j.type !== 'assistant') || j.isMeta) return out;
+  const clean = (t) => t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+  const pushText = (t) => { const c = clean(t); if (c && !c.startsWith('<')) out.push({ role: j.type, text: c }); };
+  const c = j.message?.content;
+  if (typeof c === 'string') { pushText(c); return out; }
+  if (!Array.isArray(c)) return out;
+  for (const b of c) {
+    if (b.type === 'text' && typeof b.text === 'string') pushText(b.text);
+    else if (includeTools && b.type === 'tool_use') out.push({ role: 'tool', text: JSON.stringify(b.input ?? '') });
+    else if (includeTools && b.type === 'tool_result') {
+      const t = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.filter(x => x.type === 'text').map(x => x.text).join('\n') : '';
+      if (t) out.push({ role: 'tool', text: t });
+    }
+  }
+  return out;
+}
+
+function snippetFor(text, q, radius = 90) {
+  const i = text.toLowerCase().indexOf(q.toLowerCase());
+  if (i < 0) return null;
+  const s = Math.max(0, i - radius), e = Math.min(text.length, i + q.length + radius);
+  const ws = (t) => t.replace(/\s+/g, ' ');
+  return { before: (s > 0 ? '…' : '') + ws(text.slice(s, i)), match: text.slice(i, i + q.length), after: ws(text.slice(i + q.length, e)) + (e < text.length ? '…' : '') };
+}
+
+// Calls onLine(file, rawLine) for every transcript line containing q. Resolves to true if output was capped.
+async function grepProjects(q, onLine) {
+  if (rgAvailable === null) rgAvailable = await execFileP('rg', ['--version']).then(() => true, () => false);
+  if (rgAvailable) {
+    return new Promise((resolve, reject) => {
+      const child = spawn('rg', ['--json', '-i', '-F', '--no-messages', '--max-count', String(SEARCH_MAX_LINES_PER_FILE), '--glob', '*.jsonl', '--', q, CLAUDE_PROJECTS]);
+      let buf = '', total = 0, truncated = false;
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > SEARCH_MAX_OUTPUT && !truncated) { truncated = true; child.kill(); }
+        buf += chunk;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (!line) continue;
+          try { const ev = JSON.parse(line); if (ev.type === 'match' && ev.data?.lines?.text) onLine(ev.data.path.text, ev.data.lines.text); } catch {}
+        }
+      });
+      child.on('error', reject);
+      child.on('close', () => resolve(truncated));
+    });
+  }
+  const lq = q.toLowerCase();
+  for (const d of await fsp.readdir(CLAUDE_PROJECTS, { withFileTypes: true })) {
+    if (!d.isDirectory()) continue;
+    const pdir = path.join(CLAUDE_PROJECTS, d.name);
+    for (const n of await fsp.readdir(pdir)) {
+      if (!n.endsWith('.jsonl')) continue;
+      const file = path.join(pdir, n);
+      const rl = readline.createInterface({ input: fs.createReadStream(file, 'utf8'), crlfDelay: Infinity });
+      let count = 0;
+      for await (const line of rl) {
+        if (!line.toLowerCase().includes(lq)) continue;
+        onLine(file, line);
+        if (++count >= SEARCH_MAX_LINES_PER_FILE) { rl.close(); break; }
+      }
+    }
+  }
+  return false;
+}
+
+async function searchChats(q, { includeTools = false, scope = null } = {}) {
+  q = String(q || '').trim();
+  if (q.length < 2 || q.length > 200) throw new Error('Search text must be 2–200 characters');
+  const byFile = new Map();
+  const truncated = await grepProjects(q, (file, raw) => {
+    let j; try { j = JSON.parse(raw); } catch { return; }
+    if (scope && j.cwd && !inScope(j.cwd, scope)) return;
+    for (const t of textsFromLine(j, includeTools)) {
+      const sn = snippetFor(t.text, q); if (!sn) continue;
+      let e = byFile.get(file);
+      if (!e) { e = { file, sessionId: j.sessionId || path.basename(file, '.jsonl'), cwd: j.cwd || null, branch: j.gitBranch || null, hits: 0, snippets: [], lastTs: 0 }; byFile.set(file, e); }
+      e.hits++;
+      const ts = Date.parse(j.timestamp || '') || 0; if (ts > e.lastTs) e.lastTs = ts;
+      if (e.snippets.length < 3) e.snippets.push({ role: t.role, ts, ...sn });
+    }
+  });
+  const rootOf = makeRootResolver();
+  const sessions = (await Promise.all([...byFile.values()].map(e => describeSession(e.file, { ...e, rootOf })))).filter(s => inScope(s.cwd, scope));
+  sessions.sort((a, b) => b.mtime - a.mtime);
+  return { query: q, total: sessions.length, sessions: sessions.slice(0, 100), truncated };
 }
 
 // Cheap stats for a path's Claude project dir: number of chats and newest chat mtime (ms).
@@ -224,6 +379,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/config') return json(res, 200, { reposDir: REPOS_DIR, claudeProjects: CLAUDE_PROJECTS, intellij: INTELLIJ_APP });
     if (req.method === 'GET' && url.pathname === '/api/repos') return json(res, 200, await listRepos());
     if (req.method === 'GET' && url.pathname === '/api/sessions') return json(res, 200, await sessionsFor(assertInsideRepos(url.searchParams.get('path') || '')));
+    if (req.method === 'GET' && url.pathname === '/api/search') return json(res, 200, await searchChats(url.searchParams.get('q'), { includeTools: url.searchParams.get('tools') === '1', scope: url.searchParams.get('path') ? assertInsideRepos(url.searchParams.get('path')) : null }));
+    if (req.method === 'GET' && url.pathname === '/api/recent') return json(res, 200, await recentSessions({ n: url.searchParams.get('n'), scope: url.searchParams.get('path') ? assertInsideRepos(url.searchParams.get('path')) : null }));
     if (req.method === 'GET' && url.pathname === '/api/default-base') return json(res, 200, { base: await defaultBase(assertInsideRepos(path.join(REPOS_DIR, url.searchParams.get('repo') || ''))) });
     if (req.method === 'POST') {
       const body = await readBody(req);
