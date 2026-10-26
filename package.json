@@ -2,6 +2,8 @@
   "name": "worktree-manager",
   "version": "0.1.0",
   "private": true,
+  "description": "Local web UI + macOS menu bar switcher for git worktrees, with search across Claude Code chats.",
+  "engines": { "node": ">=20" },
   "type": "module",
   "scripts": { "start": "node server.mjs" }
 }

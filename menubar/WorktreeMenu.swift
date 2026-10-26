@@ -5,6 +5,7 @@ import Carbon.HIToolbox
 import ApplicationServices
 
 let serverURL = URL(string: ProcessInfo.processInfo.environment["WM_URL"] ?? "http://127.0.0.1:7777")!
+let intellijApp = ProcessInfo.processInfo.environment["INTELLIJ_APP"] ?? "IntelliJ IDEA"   // app name passed to `open -a` when the server is down
 
 struct Worktree: Decodable { let path: String; let branch: String?; let head: String?; let detached: Bool; let exists: Bool?; let lastActivity: Double? }
 struct Repo: Decodable { let name: String; let path: String; let branch: String?; let worktrees: [Worktree]?; let error: String?; let lastActivity: Double?; let mainLastActivity: Double? }
@@ -455,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if err != nil || code != 200 {
                 // Fallback: open directly without the server.
-                let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/open"); p.arguments = ["-a", "IntelliJ IDEA.app", path]; try? p.run()
+                let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/open"); p.arguments = ["-a", intellijApp + ".app", path]; try? p.run()
             }
         }.resume()
     }
@@ -463,7 +464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func doRefresh() { refresh() }
     @objc private func startServer() {
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.lovemehta.worktree-manager"]; try? p.run(); p.waitUntilExit()
+        p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.flatpay.worktree-manager"]; try? p.run(); p.waitUntilExit()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.refresh() }
     }
 }
